@@ -1,0 +1,133 @@
+#include <iostream>
+#include <complex>
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <cstring>  // Для memset
+#include <arpa/inet.h>  // Для работы с сокетами
+
+// GetDmaBuff
+std::complex<int16_t>* GetDmaBuff(size_t N) {
+    static std::vector<std::complex<int16_t>> dmaBuff(N);
+    // Эмуляция получения данных с DMA
+    for (size_t i = 0; i < N; ++i) {
+        dmaBuff[i] = std::complex<int16_t>(i, i + 1);
+    }
+    return dmaBuff.data();
+}
+
+// Потокобезопасная очередь
+template<typename T>
+class ThreadSafeQueue {
+private:
+    std::queue<T> queue;
+    std::mutex mutex;
+    std::condition_variable cond_var;
+
+public:
+    void push(T value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        queue.push(std::move(value));
+        cond_var.notify_one();
+    }
+
+    bool pop(T& value) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cond_var.wait(lock, [this]{ return !queue.empty(); });
+        value = std::move(queue.front());
+        queue.pop();
+        return true;
+    }
+
+    bool empty() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return queue.empty();
+    }
+};
+
+// Размер буфера и параметров UDP
+const size_t BUFFER_SIZE = 65507;  // Максимальный размер UDP пакета для безопасной передачи
+const size_t DMA_BUFFER_SIZE = 1024;  // Размер буфера, возвращаемого GetDmaBuff
+
+// Флаги завершения работы
+std::atomic<bool> isRunning(true);
+
+void dmaReceiver(ThreadSafeQueue<std::vector<std::complex<int16_t>>>& queue) {
+    while (isRunning) {
+        // Получаем данные с DMA
+        std::complex<int16_t>* dmaData = GetDmaBuff(DMA_BUFFER_SIZE);
+
+        // Копируем данные в вектор для последующей передачи
+        std::vector<std::complex<int16_t>> data(dmaData, dmaData + DMA_BUFFER_SIZE);
+
+        // Помещаем данные в очередь
+        queue.push(std::move(data));
+    }
+}
+
+void udpSender(ThreadSafeQueue<std::vector<std::complex<int16_t>>>& queue, const std::string& ip, uint16_t port) {
+    // Создаем UDP сокет
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Ошибка создания сокета" << std::endl;
+        return;
+    }
+
+    sockaddr_in serverAddr;
+    std::memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &serverAddr.sin_addr);
+
+    while (isRunning) {
+        std::vector<std::complex<int16_t>> data;
+        if (queue.pop(data)) {
+            // Отправляем данные по частям, если превышаем лимит UDP пакета
+            size_t bytesToSend = data.size() * sizeof(std::complex<int16_t>);
+            size_t offset = 0;
+
+            while (bytesToSend > 0) {
+                size_t chunkSize = std::min(bytesToSend, BUFFER_SIZE);
+                ssize_t sent = sendto(sockfd, reinterpret_cast<const char*>(data.data()) + offset, chunkSize, 0,
+                                      (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+                if (sent < 0) {
+                    std::cerr << "Ошибка отправки данных" << std::endl;
+                    break;
+                }
+
+                bytesToSend -= sent;
+                offset += sent;
+            }
+        }
+    }
+
+    close(sockfd);
+}
+
+int main() {
+    ThreadSafeQueue<std::vector<std::complex<int16_t>>> queue;
+
+    // IP-адрес и порт для передачи данных
+    std::string ip = "192.168.1.100";
+    uint16_t port = 12345;
+
+    // Запуск потоков
+    std::thread dmaThread(dmaReceiver, std::ref(queue));
+    std::thread udpThread(udpSender, std::ref(queue), ip, port);
+
+    // Ожидание завершения программы (например, по нажатию клавиши)
+    std::cin.get();
+
+    // Завершаем работу
+    isRunning = false;
+
+    // Ожидаем завершения потоков
+    dmaThread.join();
+    udpThread.join();
+
+    return 0;
+}
